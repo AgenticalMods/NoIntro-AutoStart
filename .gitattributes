@@ -1,0 +1,13 @@
+* text=auto
+
+*.txt text eol=crlf
+*.md text eol=lf
+
+*.cpp text
+*.h text
+*.vcxproj text
+
+*.pak binary
+*.utoc binary
+*.ucas binary
+*.dll binary

@@ -1,0 +1,17 @@
+# Release archives (published as GitHub release assets, not committed)
+*.zip
+dist-staging/
+
+# C++ / Visual Studio build output
+[Bb]in/
+[Oo]bj/
+*.user
+*.pdb
+*.exp
+*.lib
+*.ilk
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
