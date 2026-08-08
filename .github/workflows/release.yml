@@ -1,0 +1,238 @@
+name: Release
+
+# Push an annotated tag (v1.2.0) and this gates, releases and publishes to Nexus.
+#
+# Requires:
+#   secrets.NEXUS      - org- or repo-level. https://www.nexusmods.com/settings/api-keys
+#   vars.NEXUS_FILE_ID - the FILE id (not the mod id): mod page -> Files -> API Info
+#
+# A missing secret resolves to an empty string rather than an error, so the first job
+# fails fast and says which one instead of dying inside the upload twenty minutes later.
+#
+# This workflow PACKAGES THE COMMITTED PAYLOAD; it does not rebuild the plugin.
+# install/ModLoader-Plugins/*.dll is the binary that was gate-verified in-game before
+# it was committed. Rebuilding here would publish a different binary, produced by a
+# different toolchain, that nobody has run. The gates below re-check the committed one.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v1.1.0). Use to re-run for an existing release.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN: AgenticalMods-NoIntroAutoStart
+  MOD: NoIntro-AutoStart
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Guard - Nexus credentials present
+        shell: pwsh
+        env:
+          NEXUS_KEY: ${{ secrets.NEXUS }}
+          NEXUS_FILE_ID: ${{ vars.NEXUS_FILE_ID }}
+        run: |
+          $problems = @()
+          if ([string]::IsNullOrWhiteSpace($env:NEXUS_KEY)) {
+            $problems += "secrets.NEXUS is empty - the secret is missing, misnamed, or an org secret whose visibility does not include this repository"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:NEXUS_FILE_ID)) {
+            $problems += "vars.NEXUS_FILE_ID is empty - set it with: gh variable set NEXUS_FILE_ID --repo <owner>/<repo> --body <file id>"
+          }
+          if ($problems) { $problems | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          Write-Host "Nexus credentials present (key length $($env:NEXUS_KEY.Length), file id $env:NEXUS_FILE_ID)"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version and read PluginInfo from the committed DLL
+        id: vars
+        shell: pwsh
+        run: |
+          $tag = if ('${{ inputs.tag }}') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Tag '$tag' is not vMAJOR.MINOR.PATCH" }
+          $ver = $tag.Substring(1)
+
+          # PluginInfo is a static struct; interfaceVersion is an int and is NOT recoverable by
+          # string-scanning. GetPluginInfo is exported undecorated and the SDK DllMain only calls
+          # DisableThreadLibraryCalls, so an out-of-process LoadLibrary is safe.
+          # Layout x64: 0 name | 8 version | 16 author | 24 description | 32 interfaceVersion | 36 pluginTarget
+          # Built by -join rather than a here-string: PowerShell requires the closing '@ at
+          # column 0, which would terminate this YAML block scalar.
+          $cs = @(
+            'using System;',
+            'using System.Runtime.InteropServices;',
+            'public static class PluginProbe {',
+            '  [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]',
+            '  public static extern IntPtr LoadLibrary(string p);',
+            '  [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]',
+            '  public static extern IntPtr GetProcAddress(IntPtr h, string n);',
+            '  [UnmanagedFunctionPointer(CallingConvention.Cdecl)]',
+            '  public delegate IntPtr GetInfo();',
+            '}'
+          ) -join "`n"
+          Add-Type -TypeDefinition $cs
+
+          $dll = (Resolve-Path "install\ModLoader-Plugins\$env:PLUGIN.dll").Path
+          $h = [PluginProbe]::LoadLibrary($dll)
+          if ($h -eq [IntPtr]::Zero) { throw "LoadLibrary failed for $dll" }
+          $fp = [PluginProbe]::GetProcAddress($h, 'GetPluginInfo')
+          if ($fp -eq [IntPtr]::Zero) { throw "GetPluginInfo not exported - not a ModLoader plugin?" }
+          $M = [Runtime.InteropServices.Marshal]
+          $info  = ($M::GetDelegateForFunctionPointer($fp, [PluginProbe+GetInfo])).Invoke()
+          $dllVer = $M::PtrToStringAnsi($M::ReadIntPtr($info, 8))
+          $iface  = $M::ReadInt32($info, 32)
+          $target = $M::ReadInt32($info, 36)
+          Write-Host "committed DLL reports: version=$dllVer interface=$iface target=$target"
+
+          # A shipped artifact whose version did not move is worse than a failed build.
+          if ($dllVer -ne $ver) { throw "Tag $tag implies version $ver but the committed DLL reports $dllVer. Rebuild and recommit the payload." }
+
+          "tag=$tag"       >> $env:GITHUB_OUTPUT
+          "version=$ver"   >> $env:GITHUB_OUTPUT
+          "iface=$iface"   >> $env:GITHUB_OUTPUT
+          "target=$target" >> $env:GITHUB_OUTPUT
+
+      - name: Gate 1 - interface version and plugin target
+        shell: pwsh
+        run: |
+          # PLUGIN_TARGET_CLIENT is 0. A zeroed struct is a VALID client target, so this
+          # catches a wrong pluginTarget, never an uninitialised one.
+          if ('${{ steps.vars.outputs.target }}' -ne '0') { throw "pluginTarget is ${{ steps.vars.outputs.target }}, expected 0 (client)" }
+          if ([int]'${{ steps.vars.outputs.iface }}' -le 0) { throw "interfaceVersion is ${{ steps.vars.outputs.iface }}" }
+          Write-Host "Gate 1 OK - interface ${{ steps.vars.outputs.iface }}, target 0"
+
+      - name: Gate 2 - no absolute build path in the shipped image
+        shell: pwsh
+        run: |
+          $dll = "install\ModLoader-Plugins\$env:PLUGIN.dll"
+          $txt = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+
+          # /PDBALTPATH:%_PDB% must keep the build path out of the binary.
+          $drive = [regex]::Matches($txt, '[A-Za-z]:\\[^\x00]{4,120}') | ForEach-Object { $_.Value } | Sort-Object -Unique
+          if ($drive) { $drive | ForEach-Object { Write-Host "::error::absolute path in image: $_" }; throw "Gate 2 failed" }
+
+          $pdbs = [regex]::Matches($txt, '[A-Za-z0-9_\\:.-]{0,80}\.pdb') | ForEach-Object { $_.Value } | Sort-Object -Unique
+          Write-Host "pdb reference(s): $($pdbs -join ', ')"
+          if ($pdbs | Where-Object { $_ -ne "$env:PLUGIN.pdb" }) { throw "Unexpected pdb path in image" }
+
+      - name: Assemble release assets
+        shell: pwsh
+        run: |
+          $ver  = '${{ steps.vars.outputs.version }}'
+          $tag  = '${{ steps.vars.outputs.tag }}'
+          $name = $env:PLUGIN
+          $repo = '${{ github.repository }}'
+          $root = "stage\$env:MOD-$tag"
+          New-Item -ItemType Directory -Force dist, "$root\install" | Out-Null
+
+          # The archive mirrors the repo so the README's install steps read true for
+          # someone who only has the zip. v1.0.0 and v1.0.1 shipped a README naming
+          # install\... over an archive that had no such folder.
+          Copy-Item install\Content-Paks      "$root\install\" -Recurse
+          Copy-Item install\ModLoader-Plugins "$root\install\" -Recurse
+          Copy-Item README.txt "$root\README.txt"
+          Copy-Item LICENSE    "$root\LICENSE.txt"
+
+          # The sidecar is a committed, shipped file - it must be in the payload, and its
+          # manifest_url must point at the asset this run is about to publish.
+          $sidecar = "$root\install\ModLoader-Plugins\$name.json"
+          if (-not (Test-Path $sidecar)) { throw "Update sidecar is missing - auto-update would silently not work" }
+          $expected = "https://github.com/$repo/releases/latest/download/$name-client-manifest.json"
+          $actual = (Get-Content $sidecar -Raw | ConvertFrom-Json).manifest_url
+          if ($actual -ne $expected) { throw "Sidecar manifest_url is '$actual', expected '$expected'" }
+
+          Compress-Archive -Path $root -DestinationPath "dist\$env:MOD-$tag.zip" -CompressionLevel Optimal -Force
+
+          # Bare DLL: what download_url resolves to. Must not be the zip.
+          Copy-Item "install\ModLoader-Plugins\$name.dll" "dist\$name-Client.dll"
+
+          # The range comes from the binary itself, not a hand-typed constant and not a
+          # separate SDK checkout. The loader skips a plugin iff ifaceMax < loaderMin or
+          # ifaceMin > loaderMax, and this build targets exactly one interface version.
+          ([ordered]@{
+            plugin_name           = $name
+            version               = $ver
+            interface_version_min = [int]'${{ steps.vars.outputs.iface }}'
+            interface_version_max = [int]'${{ steps.vars.outputs.iface }}'
+            download_url          = "https://github.com/$repo/releases/download/$tag/$name-Client.dll"
+          } | ConvertTo-Json -Depth 1) | Out-File "dist\$name-client-manifest.json" -Encoding utf8NoBOM
+
+          Get-ChildItem dist | ForEach-Object { "  {0,-52} {1,8}" -f $_.Name, $_.Length }
+
+      - name: Extract release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $ver = '${{ steps.vars.outputs.version }}'
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## v$([regex]::Escape($ver))\b" | Select-Object -First 1).LineNumber
+          if (-not $start) { throw "CHANGELOG.md has no '## v$ver' section - add one before tagging" }
+          $rest = $lines[$start..($lines.Count - 1)]
+          $end  = ($rest | Select-String -Pattern '^## v' | Select-Object -First 1).LineNumber
+          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
+          ($body -join "`n").Trim() | Out-File release-notes.md -Encoding utf8NoBOM
+          Write-Host "--- notes ---"; Get-Content release-notes.md
+
+      - name: Create or refresh the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag    = '${{ steps.vars.outputs.tag }}'
+          $assets = @(Get-ChildItem dist | ForEach-Object { $_.FullName })
+
+          # Idempotent: a re-run must refresh assets rather than fail on an existing release.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag exists - refreshing assets in place"
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          } else {
+            gh release create $tag @assets --title "$env:MOD $tag" --notes-file release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+
+      - name: Verify the live update chain
+        shell: pwsh
+        run: |
+          # Gates 1-2 prove the binary. They say nothing about whether the update path resolves.
+          # latest/download breaks silently if the release is not flagged latest.
+          $name = $env:PLUGIN
+          $url  = "https://github.com/${{ github.repository }}/releases/latest/download/$name-client-manifest.json"
+          $m = Invoke-RestMethod -Uri $url -MaximumRedirection 5
+          if ($m.version -ne '${{ steps.vars.outputs.version }}') { throw "latest manifest says $($m.version), expected ${{ steps.vars.outputs.version }}" }
+          Invoke-WebRequest -Uri $m.download_url -OutFile fetched.dll -MaximumRedirection 5
+          $a = (Get-FileHash fetched.dll).Hash
+          $b = (Get-FileHash "dist\$name-Client.dll").Hash
+          if ($a -ne $b) { throw "download_url serves a different binary than was released" }
+          Write-Host "Update chain OK - manifest $($m.version), download_url hash matches"
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@main
+        with:
+          api_key: ${{ secrets.NEXUS }}
+          file_id: ${{ vars.NEXUS_FILE_ID }}
+          filename: dist\NoIntro-AutoStart-${{ steps.vars.outputs.tag }}.zip
+          version: ${{ steps.vars.outputs.version }}
+          display_name: NoIntro-AutoStart ${{ steps.vars.outputs.tag }}
+          description: "Requires ModLoader with plugin interface ${{ steps.vars.outputs.iface }}. Changelog: https://github.com/${{ github.repository }}/releases/tag/${{ steps.vars.outputs.tag }}"
+          update_mod_version: true
+          # The previous build is the ONLY working one for anyone on an older loader, because
+          # the loader pins a single interface version. Archiving it would strand them.
+          archive_existing_version: false
+          # Defaults to TRUE. Our archive mirrors the repo (install\ModLoader-Plugins\...), and a
+          # mod manager deploys that verbatim into the wrong folder, so the plugin never loads.
+          # Do not enable without restructuring the archive for the game's Vortex extension.
+          allow_mod_manager_download: false
+          primary_mod_manager_download: false
